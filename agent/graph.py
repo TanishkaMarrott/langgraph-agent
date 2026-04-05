@@ -1,85 +1,66 @@
 """
-LangGraph Agent Graph
+AWS Infrastructure Audit Graph
 
-Defines the state graph and compiles it into a runnable agent.
+5-node LangGraph pipeline with conditional routing based on findings.
 
 Graph structure:
-                    ┌─────────────┐
-                    │   START     │
-                    └──────┬──────┘
-                           │
-                    ┌──────▼──────┐
-                    │  research   │◄──────────┐
-                    └──────┬──────┘           │
-                           │                  │
-               should_continue()              │
-                  /           \\               │
-           "tools"         "synthesise"       │
-              │                  │            │
-       ┌──────▼──────┐    ┌──────▼──────┐     │
-       │    tools    │    │  synthesise │     │
-       └──────┬──────┘    └──────┬──────┘     │
-              │                  │            │
-              └──────────────────┘            │
-                   back to research ──────────┘
-                   (if more tool calls)
-                          │
-                         END
 
-Key LangGraph concepts shown:
-  - StateGraph with typed state (AgentState)
-  - Conditional edges (should_continue)
-  - ToolNode for automatic tool execution
-  - Checkpointing (in-memory saver)
+    START
+      │
+    plan          ← parses audit request, sets audit_plan
+      │
+    discover      ← scans AWS services with tools, sets findings + violations
+      │
+  route_after_discovery()
+    /           \\
+deep_dive      report    ← clean account skips deep_dive entirely
+    \\           /
+     report
+      │
+     END
+
+Key LangGraph concepts:
+  StateGraph         — typed state (AuditState) passed between nodes
+  Conditional edges  — route_after_discovery() branches on violations found
+  MemorySaver        — in-memory checkpointing (pause + resume)
+  ToolNode           — automatic tool execution within discover/deep_dive nodes
 """
 
 from __future__ import annotations
 
-from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 
-from agent.nodes import research_node, synthesise_node, should_continue, tool_node
-from agent.state import AgentState
+from agent.nodes import deep_dive_node, discover_node, plan_node, report_node, route_after_discovery
+from agent.state import AuditState
 
 
-def build_graph() -> object:
-    """
-    Build and compile the research + synthesis agent graph.
+def build_graph():
+    builder = StateGraph(AuditState)
 
-    Returns a compiled LangGraph that can be invoked with:
-      graph.invoke({"query": "your question"})
-    """
-    builder = StateGraph(AgentState)
+    builder.add_node("plan", plan_node)
+    builder.add_node("discover", discover_node)
+    builder.add_node("deep_dive", deep_dive_node)
+    builder.add_node("report", report_node)
 
-    # Register nodes
-    builder.add_node("research", research_node)
-    builder.add_node("tools", tool_node)
-    builder.add_node("synthesise", synthesise_node)
+    builder.add_edge(START, "plan")
+    builder.add_edge("plan", "discover")
 
-    # Entry point
-    builder.add_edge(START, "research")
-
-    # Conditional edge from research: tools or synthesise
+    # KEY: graph topology changes based on what discover finds
     builder.add_conditional_edges(
-        "research",
-        should_continue,
+        "discover",
+        route_after_discovery,
         {
-            "tools": "tools",
-            "synthesise": "synthesise",
+            "deep_dive": "deep_dive",
+            "report": "report",
         },
     )
 
-    # After tools execute, return to research
-    builder.add_edge("tools", "research")
+    builder.add_edge("deep_dive", "report")
+    builder.add_edge("report", END)
 
-    # Synthesis is the terminal node
-    builder.add_edge("synthesise", END)
-
-    # Compile with in-memory checkpointing
-    # Replace MemorySaver with SqliteSaver or RedisSaver for persistence
     memory = MemorySaver()
     return builder.compile(checkpointer=memory)
 
 
-# Module-level compiled graph — import and use directly
 graph = build_graph()

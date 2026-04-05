@@ -1,128 +1,245 @@
 """
 Graph Nodes
 
-Each node is a pure function: (state) → state updates.
-LangGraph calls them in order based on the graph edges.
+Each node is a function: (AuditState) → dict of state updates.
+LangGraph merges the returned dict into the current state.
 
 Nodes:
-  research_node    — Claude uses tools to gather information
-  synthesise_node  — Claude synthesises research into a final answer
-  should_continue  — conditional edge: loop back or proceed to synthesis
+  plan_node       — Claude parses the audit request, produces audit_plan
+  discover_node   — Claude uses tools to scan all services, produces findings
+  deep_dive_node  — Claude investigates critical/medium violations in detail
+  report_node     — Claude generates the final AuditReport
+
+Routing:
+  route_after_discovery — conditional edge: violations? deep_dive : report
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import ToolNode
 
-from agent.state import AgentState
-from agent.tools import TOOLS
+from agent.models import AuditReport, Finding, Severity
+from agent.state import AuditState
+from agent.tools import RECOMMENDATIONS, TOOLS
 
 MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6")
 
-# Claude bound to the tools — used in research node
 _llm = ChatAnthropic(model=MODEL, temperature=0)
 _llm_with_tools = _llm.bind_tools(TOOLS)
 
-# ToolNode handles tool execution automatically
 tool_node = ToolNode(TOOLS)
 
-RESEARCH_SYSTEM = """You are a research agent. Your job is to gather information to answer a question.
+_SEVERITY_MAP = {
+    "NO_MFA": Severity.CRITICAL,
+    "PUBLIC_ACCESS": Severity.CRITICAL,
+    "OPEN_PORT": Severity.CRITICAL,
+    "PUBLIC_IP": Severity.MEDIUM,
+    "UNTAGGED": Severity.INFO,
+    "NO_ENCRYPTION": Severity.MEDIUM,
+    "MULTIPLE_KEYS": Severity.MEDIUM,
+    "STALE_USER": Severity.MEDIUM,
+}
 
-Use the available tools to search for relevant information.
-Gather 2-3 pieces of evidence before concluding your research.
-Be thorough but concise in your notes."""
-
-SYNTHESIS_SYSTEM = """You are a synthesis agent. You receive research notes and must produce a clear,
-well-structured final answer.
-
-Guidelines:
-- Lead with the direct answer
-- Support with evidence from the research notes
-- Cite sources where available
-- Be concise — no more than 3 paragraphs"""
+_RESOURCE_TYPE_MAP = {
+    "NO_MFA": "IAM",
+    "PUBLIC_ACCESS": "S3",
+    "OPEN_PORT": "SecurityGroup",
+    "PUBLIC_IP": "EC2",
+    "UNTAGGED": "EC2",
+    "NO_ENCRYPTION": "S3",
+    "MULTIPLE_KEYS": "IAM",
+    "STALE_USER": "IAM",
+}
 
 
-def research_node(state: AgentState) -> dict:
+def _parse_findings(text: str) -> list[Finding]:
+    """Parse structured findings from tool output text."""
+    findings = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for prefix, severity in _SEVERITY_MAP.items():
+            if line.startswith(prefix + ":"):
+                rest = line[len(prefix) + 1:].strip()
+                resource_id = rest.split(" ")[0] if rest else "unknown"
+                findings.append(Finding(
+                    resource_id=resource_id,
+                    resource_type=_RESOURCE_TYPE_MAP.get(prefix, "Unknown"),
+                    severity=severity,
+                    title=line[:100],
+                    description=line,
+                    recommendation=RECOMMENDATIONS.get(prefix, "Review and remediate."),
+                ))
+                break
+    return findings
+
+
+def _run_tool_loop(messages: list, max_rounds: int = 5) -> list:
+    """Run Claude + tool execution until no more tool calls or max_rounds hit."""
+    for _ in range(max_rounds):
+        response = _llm_with_tools.invoke(messages)
+        messages = messages + [response]
+        if not (hasattr(response, "tool_calls") and response.tool_calls):
+            break
+        tool_results = tool_node.invoke({"messages": messages})
+        messages = tool_results.get("messages", messages)
+    return messages
+
+
+def plan_node(state: AuditState) -> dict:
     """
-    Research node — Claude uses tools to gather information.
-
-    Reads: state.query, state.messages
-    Writes: messages (with tool calls), research_notes, sources, iteration
+    Parses the audit request and decides which AWS services to check.
+    Returns audit_plan: list of service names to audit.
     """
-    messages = list(state.messages)
+    response = _llm.invoke([
+        SystemMessage(content=(
+            "You are an AWS security auditor. Given an audit request, decide which AWS services "
+            "to check. Return ONLY a JSON array from: [\"EC2\", \"S3\", \"IAM\", \"SecurityGroups\"]. "
+            "Example: [\"EC2\", \"IAM\"]"
+        )),
+        HumanMessage(content=f"Audit request: {state.audit_request}"),
+    ])
 
-    # First iteration: inject the query as a human message
-    if state.iteration == 0:
-        messages = [
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(content=f"Research this question thoroughly: {state.query}"),
-        ]
-
-    response = _llm_with_tools.invoke(messages)
-
-    # Extract any text content as research notes
-    notes = list(state.research_notes)
-    if hasattr(response, "content") and isinstance(response.content, str) and response.content:
-        notes.append(response.content)
+    content = response.content if isinstance(response.content, str) else str(response.content)
+    try:
+        match = re.search(r"\[.*?\]", content, re.DOTALL)
+        plan = json.loads(match.group()) if match else ["EC2", "S3", "IAM", "SecurityGroups"]
+    except Exception:
+        plan = ["EC2", "S3", "IAM", "SecurityGroups"]
 
     return {
         "messages": [response],
-        "research_notes": notes,
-        "iteration": state.iteration + 1,
+        "audit_plan": plan,
+        "phase": "discover",
     }
 
 
-def synthesise_node(state: AgentState) -> dict:
+def discover_node(state: AuditState) -> dict:
     """
-    Synthesis node — Claude produces the final answer from research notes.
-
-    Reads: state.query, state.research_notes, state.messages
-    Writes: messages, final_answer
+    Scans all services in the audit_plan using AWS tools.
+    Produces findings and filters violations (CRITICAL + MEDIUM).
     """
-    # Compile research context from notes and tool results
-    tool_results = []
-    for msg in state.messages:
-        if hasattr(msg, "type") and msg.type == "tool":
-            tool_results.append(str(msg.content))
-
-    research_context = "\n\n".join(
-        [f"Research note {i+1}: {note}" for i, note in enumerate(state.research_notes)]
-        + [f"Tool result: {r}" for r in tool_results[:5]]
-    )
-
-    synthesis_messages = [
-        SystemMessage(content=SYNTHESIS_SYSTEM),
+    plan_text = ", ".join(state.audit_plan)
+    messages = [
+        SystemMessage(content=(
+            "You are an AWS security auditor. Use the tools to scan each service "
+            "in the audit plan. Call one tool per service. After scanning all services, "
+            "stop — do not call any more tools."
+        )),
         HumanMessage(content=(
-            f"Question: {state.query}\n\n"
-            f"Research gathered:\n{research_context or 'No research notes available.'}\n\n"
-            "Produce a clear, concise final answer."
+            f"Audit request: {state.audit_request}\n"
+            f"Services to check: {plan_text}\n\n"
+            "Call the appropriate tool for each service listed."
         )),
     ]
 
-    response = _llm.invoke(synthesis_messages)
-    answer = response.content if isinstance(response.content, str) else str(response.content)
+    messages = _run_tool_loop(messages, max_rounds=6)
+
+    # Extract findings from all tool results
+    all_tool_text = ""
+    for msg in messages:
+        content = msg.content if hasattr(msg, "content") else ""
+        if isinstance(content, str):
+            all_tool_text += content + "\n"
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    all_tool_text += block.get("text", "") + "\n"
+
+    findings = _parse_findings(all_tool_text)
+    violations = [f for f in findings if f.severity in (Severity.CRITICAL, Severity.MEDIUM)]
 
     return {
-        "messages": [response],
-        "final_answer": answer,
+        "messages": messages[-4:],
+        "findings": findings,
+        "violations": violations,
+        "phase": "deep_dive" if violations else "report",
     }
 
 
-def should_continue(state: AgentState) -> str:
+def deep_dive_node(state: AuditState) -> dict:
     """
-    Conditional edge — decides whether to continue tool use or move to synthesis.
-
-    Returns "tools"     → execute pending tool calls
-    Returns "synthesise" → proceed to synthesis node
+    Investigates critical and medium violations using describe_finding.
+    Enriches findings with risk detail before report generation.
     """
-    last_message = state.messages[-1] if state.messages else None
+    top_violations = state.violations[:4]
+    violation_summary = "\n".join(
+        f"- [{v.severity}] {v.resource_type} {v.resource_id}: {v.title}"
+        for v in top_violations
+    )
 
-    # If the last message has tool calls, execute them
-    if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "tools"
+    messages = [
+        SystemMessage(content=(
+            "You are an AWS security auditor investigating violations. "
+            "For each violation listed, call describe_finding to get full details. "
+            "After investigating all violations, stop."
+        )),
+        HumanMessage(content=(
+            f"Violations found during discovery:\n{violation_summary}\n\n"
+            "Investigate each one using describe_finding."
+        )),
+    ]
 
-    # If we've done enough research (or no more tool calls), synthesise
-    return "synthesise"
+    messages = _run_tool_loop(messages, max_rounds=4)
+
+    return {
+        "messages": messages[-4:],
+        "phase": "report",
+    }
+
+
+def report_node(state: AuditState) -> dict:
+    """
+    Generates the final structured AuditReport from all findings.
+    """
+    findings_text = "\n".join(
+        f"[{f.severity}] {f.resource_type} {f.resource_id}: {f.description}\n"
+        f"  → Recommendation: {f.recommendation}"
+        for f in state.findings
+    ) or "No findings — account appears clean."
+
+    response = _llm.invoke([
+        SystemMessage(content=(
+            "You are an AWS security auditor writing a final report. "
+            "Structure your report: one-line SUMMARY, then CRITICAL findings, "
+            "then MEDIUM findings, then INFO. Be specific and actionable."
+        )),
+        HumanMessage(content=(
+            f"Audit request: {state.audit_request}\n\n"
+            f"Findings:\n{findings_text}\n\n"
+            "Write the final audit report."
+        )),
+    ])
+
+    report_text = response.content if isinstance(response.content, str) else str(response.content)
+
+    report = AuditReport(
+        audit_request=state.audit_request,
+        summary=report_text,
+        findings=state.findings,
+    )
+
+    return {
+        "messages": [response],
+        "report": report,
+        "phase": "complete",
+    }
+
+
+def route_after_discovery(state: AuditState) -> str:
+    """
+    Conditional edge after discover_node.
+
+    Violations (CRITICAL or MEDIUM) found → deep_dive for detailed investigation.
+    Account is clean → skip deep_dive, go straight to report.
+    """
+    if state.violations:
+        return "deep_dive"
+    return "report"
