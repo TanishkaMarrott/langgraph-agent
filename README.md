@@ -6,6 +6,8 @@ Stateful LangGraph pipeline that audits AWS infrastructure from a plain-English 
 ![LangGraph](https://img.shields.io/badge/Framework-LangGraph-orange)
 ![Claude](https://img.shields.io/badge/LLM-Claude-purple)
 ![CI](https://github.com/TanishkaMarrott/langgraph-agent/actions/workflows/ci.yml/badge.svg)
+![Tests](https://img.shields.io/badge/Tests-43%20passing-brightgreen)
+![Coverage](https://img.shields.io/badge/Coverage-59%25-yellow)
 
 ---
 
