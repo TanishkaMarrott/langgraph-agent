@@ -9,6 +9,9 @@ Stateful LangGraph pipeline that audits AWS infrastructure from a plain-English 
 ![Tests](https://img.shields.io/badge/Tests-43%20passing-brightgreen)
 ![Coverage](https://img.shields.io/badge/Coverage-59%25-yellow)
 
+
+> *Personal portfolio project, built and iterated Mar–Apr 2026.*
+
 ---
 
 ## The Problem
